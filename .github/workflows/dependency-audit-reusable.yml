@@ -7,17 +7,32 @@
 # audit tool. Fails the build if any dependency has a known security advisory.
 # The `Audit gate` job is the aggregate result of detection plus every audit.
 #
-# Cargo/Python discovery and the gate verdict live in
+# Go/Cargo/Python discovery and the gate verdict live in
 # .github/scripts/dependency-audit/lib/dependency-audit.sh (bats-tested in
 # test/workflows/dependency-audit/); the jobs check this repo out at the
 # reusable's own commit and source it.
 #
 # Pinned tool versions (update deliberately):
-#   govulncheck v1.1.4 | cargo-audit 0.22.1 | pip-audit 2.9.0
+#   govulncheck v1.9.0 | cargo-audit 0.22.1 | pip-audit 2.9.0
+#   Python 3.13 for pip-audit (`python-version` input). Never a floating "3.x":
+#   a new Python release can break the hash-locked tooling for every caller at
+#   once (3.15 removed sre_constants, crashing pip-api 0.0.34's vendored
+#   pyparsing).
+#   Go `stable` for govulncheck, on purpose: setup-go sets GOTOOLCHAIN=local, so
+#   the toolchain must be at least every audited go.mod's `go` line, and a fixed
+#   pin would break the job the day a caller bumps it. The cost is that a new Go
+#   release can outrun an old govulncheck's x/tools parser (v1.1.4 panicked with
+#   `unexpected expr: *ast.KeyValueExpr` on Go 1.27), so keep govulncheck current.
 name: Dependency audit (Reusable)
 
 on:
   workflow_call:
+    inputs:
+      python-version:
+        description: "Python minor the pip-audit tooling runs on (pinned; never a floating 3.x)"
+        required: false
+        type: string
+        default: "3.13"
 
 permissions:
   contents: read
@@ -107,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -132,26 +147,38 @@ jobs:
     if: needs.detect.outputs.gomod == 'true'
     runs-on: ubuntu-latest
     steps:
+      # The audited repo goes in `repo/` so the tooling checkout below is never
+      # part of the tree being scanned.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          persist-credentials: false
+
+      # Same tooling source as audit-cargo.
+      - name: Check out dependency-audit tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: combsmith/.github
+          ref: ${{ job.workflow_sha }}
+          path: .dependency-audit-tooling
+          fetch-depth: 1
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v5
         with:
           go-version: "stable"
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4  # NOSONAR(githubactions:S8545) pinned @vX.Y.Z is reproducible (verified via Go checksum DB); no --locked equivalent
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0  # NOSONAR(githubactions:S8545) pinned @vX.Y.Z is reproducible (verified via Go checksum DB); no --locked equivalent
 
       - name: Audit Go dependencies
+        working-directory: repo
         run: |
-          status=0
-          while IFS= read -r dir; do
-            echo "::group::govulncheck $dir"
-            if ! (cd "$dir" && govulncheck ./...); then
-              status=1
-            fi
-            echo "::endgroup::"
-          done < <(find . -name 'go.mod' -not -path '*/vendor/*' -exec dirname {} \;)
-          exit $status
+          # One scan per go.mod. A module with no packages (e.g. a go.work
+          # root) is skipped with a notice instead of failing the job.
+          # shellcheck source=/dev/null
+          . ../.dependency-audit-tooling/.github/scripts/dependency-audit/lib/dependency-audit.sh
+          dep_audit_go_run .
 
   audit-cargo:
     name: cargo audit
@@ -222,7 +249,7 @@ jobs:
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.x"
+          python-version: ${{ inputs.python-version }}
 
       - name: Install pip-audit
         run: 'pip install --require-hashes --only-binary :all: -r .dependency-audit-tooling/scripts/pip-audit-requirements.txt'
